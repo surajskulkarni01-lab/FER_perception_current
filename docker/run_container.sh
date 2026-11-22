@@ -1,0 +1,131 @@
+#!/bin/bash
+#    Copyright 2025 Proximity Robotics & Automation GmbH
+#    Modifications copyright 2026 Georgios Katranis
+#
+#    This script is derived from internal Docker tooling developed at
+#    Proximity Robotics & Automation GmbH. It has been adapted for the
+#    RealSense D405 perception stack on the Franka Emika Robot (FER):
+#    architecture-specific image tag, GPU and camera access, optional X
+#    authority mount, and the persistent Claude session directory.
+
+#    Licensed under the Apache License, Version 2.0 (the "License");
+#    you may not use this file except in compliance with the License.
+#    You may obtain a copy of the License at
+
+#        http://www.apache.org/licenses/LICENSE-2.0
+
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS,
+#    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#    See the License for the specific language governing permissions and
+#    limitations under the License.
+
+uid=$(eval "id -u")
+gid=$(eval "id -g")
+
+# ANSI escape codes
+RED_BOLD="\033[1;31m"
+YELLOW_BOLD="\033[1;33m"
+GREEN_BOLD="\033[1;32m"
+RESET="\033[0m"
+
+PACKAGE_NAME="fer_perception"
+CONTAINER_USER="fer_perception"
+IMAGE="$PACKAGE_NAME/ros:jazzy_$(uname -m)"
+
+# Set Package root
+if [[ "$(pwd)" == *"/$PACKAGE_NAME/"* ]]; then
+    # Case A: Inside a subdirectory
+    echo -e "${YELLOW_BOLD}Inside subdirectory. Navigating to root...${RESET}"
+    # Strip everything after the package name to find the root
+    _cwd="$(pwd)"
+    PACKAGE_ROOT="${_cwd%%/$PACKAGE_NAME/*}/$PACKAGE_NAME"
+    cd "$PACKAGE_ROOT" || exit 1
+elif [[ "$(pwd)" == *"/$PACKAGE_NAME" ]]; then
+    # Case B: Already at the root
+    echo -e "${GREEN_BOLD}Already at package root.${RESET}"
+    PACKAGE_ROOT="$(pwd)"
+else
+    # Case C: Not in the package at all
+    echo -e "${RED_BOLD}Error: You are not inside the directory '$PACKAGE_NAME'.${RESET}"
+    echo "Current path: $(pwd)"
+    exit 1
+fi
+
+# Check if DISPLAY is set
+if [ "$DISPLAY" ]; then
+    xhost + local:root
+fi
+
+# Check and create necessary folders
+for FOLDER in ros2_ws/src env log data; do
+    HOST_PATH="$PACKAGE_ROOT/$FOLDER"
+    if [ ! -d "$HOST_PATH" ]; then
+        echo -e "${YELLOW_BOLD}Warning: $HOST_PATH does not exist. Creating it...${RESET}"
+        mkdir -p "$HOST_PATH"
+    fi
+done
+
+# Create the .claude_container, so sessions with claude inside docker persist
+for FOLDER in .claude_container; do 
+    HOST_PATH="$PACKAGE_ROOT/$FOLDER"
+    if [ ! -d "$HOST_PATH" ]; then
+        echo -e "${YELLOW_BOLD}Warning: $HOST_PATH does not exist. Creating it...${RESET}"
+        mkdir -p "$HOST_PATH"
+    fi
+done
+
+# Mount the X authority file only where one exists
+XAUTH_MOUNT=()
+if [ -f "$HOME/.Xauthority" ]; then
+    XAUTH_MOUNT=(-v "$HOME/.Xauthority:/home/${CONTAINER_USER}/.Xauthority")
+fi
+
+# GPU access differs per architecture:
+#  - x86_64: discrete NVIDIA GPU, via the nvidia runtime.
+#  - aarch64: Jetson Orin integrated GPU. Its device nodes (/dev/nvgpu, /dev/nvmap)
+#    are group-restricted, and -v /dev:/dev passes the host permissions through, so
+#    the container user needs the host's render group (its GID differs per system).
+GPU_ARGS=()
+case "$(uname -m)" in
+    x86_64)
+        GPU_ARGS=(--runtime nvidia)
+        ;;
+    aarch64)
+        GPU_ARGS=(--runtime nvidia)
+        RENDER_GID="$(getent group render | cut -d: -f3)"
+        if [ -n "$RENDER_GID" ]; then
+            GPU_ARGS+=(--group-add "$RENDER_GID")
+        else
+            echo -e "${YELLOW_BOLD}Warning: no 'render' group on this host; CUDA may fail for the container user.${RESET}"
+        fi
+        ;;
+    *)
+        echo -e "${RED_BOLD}Error: unsupported architecture '$(uname -m)'.${RESET}"
+        exit 1
+        ;;
+esac
+
+docker run \
+    --name $PACKAGE_NAME \
+    -it \
+    --privileged \
+    --net host \
+    --ipc host \
+    "${GPU_ARGS[@]}" \
+    -e NVIDIA_VISIBLE_DEVICES=all \
+    -e NVIDIA_DRIVER_CAPABILITIES=all \
+    -e DISPLAY=$DISPLAY \
+    -e ROS_LOG_DIR=/home/${CONTAINER_USER}/logs \
+    -e FASTRTPS_DEFAULT_PROFILES_FILE=/home/${CONTAINER_USER}/env/fast_dds_2.xml \
+    -v $PACKAGE_ROOT/log:/home/${CONTAINER_USER}/logs \
+    -v /tmp/.X11-unix:/tmp/.X11-unix \
+    -v /dev:/dev \
+    "${XAUTH_MOUNT[@]}" \
+    -v $PACKAGE_ROOT/ros2_ws:/home/${CONTAINER_USER}/ros2_ws \
+    -v $PACKAGE_ROOT/env:/home/${CONTAINER_USER}/env \
+    -v $PACKAGE_ROOT/data:/home/${CONTAINER_USER}/data \
+    -v $PACKAGE_ROOT/.claude_container:/home/${CONTAINER_USER}/.claude \
+    --entrypoint /bin/bash \
+    --rm \
+    $IMAGE

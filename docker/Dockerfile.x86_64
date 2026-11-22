@@ -1,0 +1,182 @@
+#    Copyright 2025 Proximity Robotics & Automation GmbH
+#    Modifications copyright 2026 Georgios Katranis
+#
+#    This Dockerfile is derived from internal Docker tooling developed at
+#    Proximity Robotics & Automation GmbH. It has been adapted for the
+#    RealSense D405 perception stack on the Franka Emika Robot (FER):
+#    dependency set, user-creation block, RealSense driver and PyTorch,
+#    fer_interfaces built from a pinned fer_ros2 release, colcon build stage,
+#    and a per-architecture Dockerfile (this one: x86_64) have been modified.
+#    The original layering pattern is retained.
+#
+#    Licensed under the Apache License, Version 2.0 (the "License");
+#    you may not use this file except in compliance with the License.
+#    You may obtain a copy of the License at
+#
+#        http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS,
+#    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#    See the License for the specific language governing permissions and
+#    limitations under the License.
+
+##############################################################################
+##                                 Base Image                               ##
+##############################################################################
+ARG ROS_DISTRO=jazzy
+FROM ros:${ROS_DISTRO}-ros-base
+ENV PROJECT_WS=ros2_ws
+ENV TZ=Europe/Berlin
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+
+##############################################################################
+##                                 Global Dependecies                       ##
+##############################################################################
+
+
+RUN apt-get update && apt-get upgrade -y \
+    && apt-get install --no-install-recommends -y \
+    apt-utils \
+    aptitude \
+    sudo \
+    nano \
+    curl \
+    wget \
+    tmux \
+    build-essential \
+    software-properties-common \
+    cmake \
+    git \
+    gcc \
+    python3-pip \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+##############################################################################
+##                                 Create User                              ##
+##############################################################################
+ARG USER=fer_perception
+ARG UID=1000
+ARG GID=$UID
+ARG ROS_DOMAIN_ID=0
+ARG VIDEO_GID=44
+ENV USER=${USER}
+ENV UID=${UID}
+ENV GID=${GID}
+ENV ROS_DOMAIN_ID=${ROS_DOMAIN_ID}
+
+# Remove any existing user holding the target UID (e.g. Ubuntu Noble ships
+# an `ubuntu` user at UID 1000) and recreate it under ${USER}. The video and
+# plugdev groups give access to the camera and the display.
+RUN existing_user="$(getent passwd | awk -F: -v target_uid=${UID} '$3 == target_uid { print $1 }')" && \
+    if [ -n "$existing_user" ]; then \
+        userdel --remove "$existing_user"; \
+    fi && \
+    if ! getent group "$GID" >/dev/null 2>&1; then \
+        groupadd -g "$GID" "$USER"; \
+    fi && \
+    useradd -m -u "$UID" -g "$GID" --shell "$(which bash)" "$USER" -G sudo && \
+    groupmod -g ${VIDEO_GID} video && \
+    usermod -aG video "$USER" && \
+    usermod -aG plugdev "$USER"
+
+RUN echo "%sudo ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/sudogrp && \
+    chmod 0440 /etc/sudoers.d/sudogrp
+
+RUN echo "source /opt/ros/$ROS_DISTRO/setup.bash" >> /etc/bash.bashrc
+RUN echo "source /home/$USER/deps_ws/install/setup.bash" >> /etc/bash.bashrc
+RUN echo "source /home/$USER/$PROJECT_WS/install/setup.bash" >> /etc/bash.bashrc
+RUN echo "export ROS_DOMAIN_ID=${ROS_DOMAIN_ID}" >> /etc/bash.bashrc
+RUN echo "source /usr/share/colcon_argcomplete/hook/colcon-argcomplete.bash" >> /etc/bash.bashrc
+
+ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+ENV FASTRTPS_DEFAULT_PROFILES_FILE=/home/${USER}/env/fast_dds_1.xml
+
+# Create base directories
+USER ${USER}
+RUN mkdir -p /home/${USER}/${PROJECT_WS}/src
+RUN mkdir -p /home/${USER}/deps
+RUN mkdir -p /home/${USER}/deps_ws/src
+##############################################################################
+##                                 Dependencies                             ##
+##############################################################################
+USER root
+
+RUN apt-get update && \
+    apt-get install -y \
+    python3-colcon-common-extensions \
+    python3-rosdep \
+    ros-${ROS_DISTRO}-rviz2 \
+    ros-${ROS_DISTRO}-realsense2-camera \
+    ros-${ROS_DISTRO}-realsense2-description \
+    ros-${ROS_DISTRO}-vision-msgs \
+    && rm -rf /var/lib/apt/lists/*
+
+# CUDA builds of PyTorch for x86_64 PCs. The CUDA runtime comes with the wheels;
+# the driver comes from the host through the NVIDIA container runtime. Installed
+# after the apt packages, so the system numpy that cv_bridge is built against
+# stays in place.
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu130
+ARG TORCH_VERSION=2.14.1+cu130
+ARG TORCHVISION_VERSION=0.29.1+cu130
+RUN pip3 install --no-cache-dir --break-system-packages \
+    --index-url ${TORCH_INDEX_URL} \
+    torch==${TORCH_VERSION} \
+    torchvision==${TORCHVISION_VERSION}
+
+USER ${USER}
+
+##############################################################################
+##                                 External ROS Packages                    ##
+##############################################################################
+# Pinned upstream packages, built once into ~/deps_ws as an underlay of
+# ros2_ws. Each ARG sits right before its step --> change of ARG rebuilds from that step on.
+
+WORKDIR /home/${USER}/deps_ws
+# fer_interfaces only, from a fer_ros2 release.
+ARG FER_ROS2_REF=jazzy-0.2.1
+RUN git clone --depth 1 --branch ${FER_ROS2_REF} --filter=blob:none --sparse \
+    https://github.com/GKnerd/fer_ros2.git src/fer_ros2 && \
+    git -C src/fer_ros2 sparse-checkout set ros2_ws/src/fer_interfaces
+
+RUN sudo apt-get update && \
+    rosdep update && \
+    rosdep install --from-paths src --ignore-src -r -y
+
+RUN . /opt/ros/$ROS_DISTRO/setup.sh && \
+    colcon build --merge-install \
+    --cmake-args -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_TESTING=OFF
+
+##############################################################################
+##                                 Build ROS                                ##
+##############################################################################
+WORKDIR /home/${USER}/${PROJECT_WS}
+COPY --chown=${USER}:${USER} ${PROJECT_WS}/src /home/$USER/${PROJECT_WS}/src
+
+# The external packages come from ~/deps_ws; keep rosdep from installing
+# their apt releases.
+RUN sudo apt-get update && \
+    rosdep update && \
+    rosdep install --from-paths src --ignore-src -r -y \
+    --skip-keys "fer_interfaces"
+
+RUN . /opt/ros/$ROS_DISTRO/setup.sh && \
+    . /home/${USER}/deps_ws/install/setup.sh && \
+    colcon build --symlink-install \
+    --merge-install \
+    --cmake-clean-cache \
+    --cmake-args -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+    -DBUILD_TESTING=ON
+
+RUN echo "source /home/$USER/ros2_ws/install/setup.bash" >> /home/$USER/.bashrc
+
+RUN sudo sed --in-place --expression \
+    '$isource "/home/$USER/${PROJECT_WS}/install/setup.bash"' \
+    /ros_entrypoint.sh
+
+CMD ["/bin/bash"]
